@@ -3,17 +3,22 @@ import os
 import mediapipe as mp
 import cv2
 import keyboard
-from tensorflow.keras.models import load_model
+import torch
+import torch.nn as nn
+import torch.nn.functional as F  # --- ADDED ---
 from PIL import ImageFont, ImageDraw, Image
 from llm_sentence_generator import LLMSentenceGenerator
-import joblib
+
+# import joblib  # --- REMOVED ---
 
 # -------------------------------
 # CONFIG
 # -------------------------------
-SEQUENCE_LENGTH = 10  # Match training sequence length
+SEQUENCE_LENGTH = 20  # Match training sequence length
 CONFIDENCE_THRESHOLD = 0.9
 FONT_PATH = "font.ttf"
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 
 # -------------------------------
 # HELPER FUNCTIONS
@@ -37,8 +42,9 @@ def draw_landmarks(image, results):
     mp_drawing.draw_landmarks(image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
 
 
-# Import the corrected keypoint extraction function
+# Import the raw keypoint extraction function (extracts 225 features)
 from my_functions import keypoint_extraction
+
 
 def draw_armenian_text(img, text, position, font_path=FONT_PATH, font_size=32, color=(255, 255, 255)):
     if not text:
@@ -53,43 +59,156 @@ def draw_armenian_text(img, text, position, font_path=FONT_PATH, font_size=32, c
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
 
+# -----------------------------------------------
+# --- MODIFIED: ADDED PREPROCESSING FROM TRAIN SCRIPT ---
+# -----------------------------------------------
+def preprocess_keypoints(sequence):
+    """
+    Applies normalization and motion deltas to the raw keypoint sequence.
+    Input shape: (20, 225)
+    Output shape: (20, 450)
+    """
+    if not isinstance(sequence, np.ndarray):
+        sequence = np.array(sequence)
+
+    # --- A. Normalization (Translation Invariance) ---
+    # Reshape to (seq_len, num_groups, num_keypoints, num_coords)
+    pose = sequence[:, :99].reshape(SEQUENCE_LENGTH, 33, 3)
+    lh = sequence[:, 99:162].reshape(SEQUENCE_LENGTH, 21, 3)
+    rh = sequence[:, 162:225].reshape(SEQUENCE_LENGTH, 21, 3)
+
+    # Get reference points (wrist for hands, nose for pose)
+    nose = pose[:, 0:1, :]
+    lwrist = lh[:, 0:1, :]
+    rwrist = rh[:, 0:1, :]
+
+    # Subtract the reference point.
+    pose_norm = pose - nose
+    lh_norm = lh - lwrist
+    rh_norm = rh - rwrist
+
+    # Flatten back to (20, 225)
+    normalized_sequence = np.concatenate([
+        pose_norm.reshape(SEQUENCE_LENGTH, 99),
+        lh_norm.reshape(SEQUENCE_LENGTH, 63),
+        rh_norm.reshape(SEQUENCE_LENGTH, 63)
+    ], axis=1)
+
+    # --- B. Motion Deltas (Velocity) ---
+    deltas = np.diff(normalized_sequence, axis=0)
+    deltas = np.concatenate([np.zeros((1, 225)), deltas], axis=0)  # Pad first frame
+
+    # --- C. Concatenate Features ---
+    # Final shape: (20, 450)
+    final_features = np.concatenate([normalized_sequence, deltas], axis=1)
+
+    return final_features
+
+
+# -----------------------------------------------
+# --- MODIFIED: MODEL DEFINITION (same as training) ---
+# -----------------------------------------------
+class Attention(nn.Module):
+    """Simple dot-product attention."""
+
+    def __init__(self, hidden_size):
+        super(Attention, self).__init__()
+        self.weights = nn.Parameter(torch.randn(hidden_size))
+
+    def forward(self, x):
+        scores = torch.matmul(x, self.weights)
+        attn_weights = F.softmax(scores, dim=1)
+        context_vector = torch.sum(x * attn_weights.unsqueeze(-1), dim=1)
+        return context_vector, attn_weights
+
+
+class SignLanguageGRU(nn.Module):
+    def __init__(self, input_size, num_classes, hidden_size=128, num_gru_layers=2, dropout=0.3):
+        super(SignLanguageGRU, self).__init__()
+
+        self.gru = nn.GRU(
+            input_size,
+            hidden_size,
+            num_layers=num_gru_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_gru_layers > 1 else 0
+        )
+
+        gru_output_size = hidden_size * 2
+        self.bn1 = nn.BatchNorm1d(gru_output_size)
+        self.attention = Attention(gru_output_size)
+
+        self.fc1 = nn.Linear(gru_output_size, 64)
+        self.dropout1 = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(64, num_classes)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        gru_out, _ = self.gru(x)
+        context_vector, _ = self.attention(gru_out)
+        bn_out = self.bn1(context_vector)
+
+        x = self.relu(self.fc1(bn_out))
+        x = self.dropout1(x)
+        x = self.fc2(x)
+        return x
+
+
 # -------------------------------
 # MAIN APPLICATION
 # -------------------------------
 
 try:
-    actions = np.load('actions.npy')
-    print(f"Loaded actions from actions.npy: {actions}")
+    # --- MODIFIED: Load class_mapping.npy (which is a dict) ---
+    class_to_idx = np.load('class_mapping.npy', allow_pickle=True).item()
+
+    # --- MODIFIED: Recreate the actions list in the correct order ---
+    num_actions = len(class_to_idx)
+    actions = [""] * num_actions
+    for class_name, class_idx in class_to_idx.items():
+        actions[class_idx] = class_name
+
+    print(f"Loaded actions from class_mapping.npy: {actions}")
+
 except Exception as e:
-    print(f"Error loading actions.npy: {e}")
-    print("Train the model first (train_model.py) to generate actions.npy")
+    print(f"Error loading class_mapping.npy: {e}")
+    print("Train the model first (train_model.py) to generate class_mapping.npy")
     exit()
 
 try:
-    model = load_model('my_model.h5')
-    print("Model loaded successfully!")
-    print(f"Model input shape: {model.input_shape}")
-    print(f"Model output shape: {model.output_shape}")
-except Exception as e:
-    raise e
+    # --- MODIFIED: Load PyTorch GRU model from best_model.pth ---
+    checkpoint_path = 'best_model.pth'  # This matches train_model.py
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"{checkpoint_path} not found. Please train the model first.")
 
-try:
-    scaler = joblib.load('feature_scaler.pkl')
-    print("Feature scaler loaded.")
+    # Create model with INPUT_SIZE = 450
+    model = SignLanguageGRU(input_size=450, num_classes=len(actions)).to(device)
+
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # --- FIXED: Use .load_state_dict() instead of .load() ---
+    model.load_state_dict(checkpoint)
+    print(f"Model loaded from {checkpoint_path}")
+
+    model.eval()
+    print("Model loaded successfully!")
 except Exception as e:
-    scaler = None
-    print("Warning: feature_scaler.pkl not found. Proceeding without standardization.")
     print(f"Error loading model: {e}")
+    import traceback
+
+    traceback.print_exc()
     print("Make sure you have trained the model first by running train_model.py")
     exit()
 
+# --- MODIFIED: REMOVED SCALER LOADING ---
+print("Preprocessing (Normalization + Deltas) is built into this script.")
+print("No feature_scaler.pkl needed.")
+
 # Validate that model output size matches number of actions
 num_actions = len(actions)
-model_outputs = model.output_shape[-1]
-if model_outputs != num_actions:
-    print(f"Error: Model outputs {model_outputs} classes, but actions.npy has {num_actions} labels.")
-    print("Ensure you're using the matching model and actions.npy from the same training run.")
-    exit()
+print(f"Model configured for {num_actions} classes")
 
 sentence, keypoints, last_prediction = [], [], None
 prediction_history = []  # Store recent predictions for smoothing
@@ -113,41 +232,48 @@ with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=
         image, results = image_process(image, holistic)
         draw_landmarks(image, results)
 
-        # Extract keypoints and validate shape
+        # Extract raw keypoints and validate shape
         current_keypoints = keypoint_extraction(results)
         if current_keypoints.shape[0] != 225:
             print(f"Warning: Expected 225 features, got {current_keypoints.shape[0]}")
             continue
-            
+
         keypoints.append(current_keypoints)
         keypoints = keypoints[-SEQUENCE_LENGTH:]
 
         if len(keypoints) == SEQUENCE_LENGTH:
-            keypoints_array = np.array(keypoints)
-            # Validate the array shape before prediction
+            keypoints_array = np.array(keypoints)  # Shape: (20, 225)
+
+            # Validate the raw array shape
             if keypoints_array.shape != (SEQUENCE_LENGTH, 225):
                 print(f"Warning: Expected shape ({SEQUENCE_LENGTH}, 225), got {keypoints_array.shape}")
                 continue
-                
-            # Apply the same standardization as training, if available
-            if scaler is not None:
-                keypoints_array = scaler.transform(keypoints_array)
 
-            prediction = model.predict(keypoints_array[np.newaxis, :, :], verbose=0)
-            
-            # Get prediction details
-            max_prob = np.amax(prediction)
-            predicted_class = np.argmax(prediction)
+            # --- MODIFIED: Apply the SAME preprocessing as training ---
+            processed_keypoints = preprocess_keypoints(keypoints_array)  # Shape: (20, 450)
+
+            # Convert to PyTorch tensor and predict
+            keypoints_tensor = torch.FloatTensor(processed_keypoints).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                outputs = model(keypoints_tensor)
+                probabilities = torch.softmax(outputs, dim=1)
+                max_prob, predicted_class = torch.max(probabilities, dim=1)
+                max_prob = max_prob.item()
+                predicted_class = predicted_class.item()
+
             action = actions[predicted_class]
-            
+
+            # (Rest of your prediction/smoothing logic is unchanged)
+
             # Add to prediction history for smoothing
             prediction_history.append((action, max_prob))
             if len(prediction_history) > 5:  # Keep only last 5 predictions
                 prediction_history.pop(0)
-            
+
             # Debug information
             print(f"Prediction: {action} (confidence: {max_prob:.3f})")
-            
+
             # Only add prediction if confidence is high enough
             if max_prob > CONFIDENCE_THRESHOLD:
                 # Check if this prediction appears consistently in recent history
@@ -161,13 +287,15 @@ with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=
                             sentence.append(action)
                             last_prediction = action
                             print(f"Added to sentence: {action} (smoothed)")
-                else:
-                    print(f"Prediction not consistent: {action} appears {recent_actions.count(action)}/3 times")
+                # else:
+                # print(f"Prediction not consistent: {action} appears {recent_actions.count(action)}/3 times")
             else:
                 print(f"Low confidence: {max_prob:.3f} < {CONFIDENCE_THRESHOLD}")
 
             if len(sentence) > 5:
                 sentence = sentence[-5:]
+
+        # (Rest of your keyboard/display logic is unchanged)
 
         if keyboard.is_pressed(' '):
             if not collecting_words:
@@ -196,13 +324,13 @@ with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=
                 display_text = f"Collecting: {' '.join(word_buffer)} (Press SPACE to generate sentence)"
             else:
                 display_text = "Collecting words... (Press SPACE to generate sentence)"
-            print(f"📝 Word buffer: {word_buffer}")
+            # print(f"📝 Word buffer: {word_buffer}")
         elif sentence:
             display_text = sentence[-1] if sentence else "No sentence yet"
-            print(f"📝 Current sentence: {display_text}")
+            # print(f"📝 Current sentence: {display_text}")
         else:
             display_text = "Press SPACE to start collecting words"
-            print("Waiting for SPACE to start...")
+            # print("Waiting for SPACE to start...")
         text_size, _ = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
         x_pos = (image.shape[1] - text_size[0]) // 2 if text_size[0] < image.shape[1] else 0
         y_pos = image.shape[0] - 40

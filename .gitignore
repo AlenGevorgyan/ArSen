@@ -1,0 +1,20 @@
+# Ignore Python virtual environments
+.venv/
+
+# Ignore raw and processed datasets
+dataset/
+dataset_processed/
+
+# Ignore model weights
+best_model.pth
+my_model.pth
+
+# Ignore generated mapping/scaler files
+class_mapping.npy
+feature_scaler.pkl
+
+# Ignore any large zip files
+*.zip
+
+# Ignore MediaPipe's font file
+font.ttf

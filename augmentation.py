@@ -6,12 +6,17 @@ from pathlib import Path
 
 # === CONFIG ===
 VIDEO_ROOT = r"videos"
+SAVE_ROOT = r"dataset"
+SEQUENCE_LENGTH = 20
 
-SAVE_ROOT = r"dataset2"
-
-SEQUENCE_LENGTH = 30
-
+# --- Augmentation Config ---
+# 1. Scaling (your original augmentation)
+#    This makes the fingers longer/shorter relative to their base knuckle
 SCALE_VALUES = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9]
+
+# 2. Jitter (new augmentation)
+#    This adds small random noise to hand keypoints to simulate tiny variations
+JITTER_STRENGTHS = [0.002, 0.005]  # Small std dev for random noise
 
 # === INIT ===
 holistic = mp.solutions.holistic.Holistic(
@@ -22,36 +27,28 @@ holistic = mp.solutions.holistic.Holistic(
 )
 
 
-# === UTILITIES (Unchanged) ===
+# === KEYPOINT EXTRACTION (Simplified) ===
 
 def extract_keypoints(results):
     """Extract keypoints and return concatenated 225 features (pose + left hand + right hand)"""
-    # Extract pose landmarks (33 points * 3 coordinates = 99 features)
+    # 99 features for pose
     pose = np.array([[lm.x, lm.y, lm.z] for lm in
                      results.pose_landmarks.landmark]).flatten() if results.pose_landmarks else np.zeros(33 * 3)
 
-    # Extract left hand landmarks (21 points * 3 coordinates = 63 features)
+    # 63 features for left hand
     lh = np.array([[lm.x, lm.y, lm.z] for lm in
                    results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(21 * 3)
 
-    # Extract right hand landmarks (21 points * 3 coordinates = 63 features)
+    # 63 features for right hand
     rh = np.array([[lm.x, lm.y, lm.z] for lm in
-                   results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21 * 3)
+                   results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(
+        21 * 3)
 
-    # CONCATENATE THE ARRAYS INTO ONE 225-FEATURE ARRAY
-    keypoints = np.concatenate([pose, lh, rh])
-    
-    # Ensure we have exactly 225 features
-    if len(keypoints) != 225:
-        print(f"Warning: Expected 225 features, got {len(keypoints)}")
-        # Pad with zeros or truncate as needed
-        if len(keypoints) < 225:
-            keypoints = np.pad(keypoints, (0, 225 - len(keypoints)), 'constant')
-        else:
-            keypoints = keypoints[:225]
-    
-    return keypoints
+    # Total = 99 + 63 + 63 = 225 features
+    return np.concatenate([pose, lh, rh])
 
+
+# === AUGMENTATION FUNCTIONS ===
 
 def reshape_hand(flat):
     return flat.reshape((21, 3))
@@ -73,130 +70,162 @@ def clip_coords(hand3d):
     return hand3d
 
 
-def scale_keypoints(keypoints, scale_factor):
-    """Scale hand keypoints while keeping pose unchanged"""
+def apply_scaling(sequence, scale_factor):
+    """
+    Applies the finger-scaling augmentation to an entire sequence.
+    'sequence' must be a numpy array of shape (SEQUENCE_LENGTH, 225)
+    """
     if scale_factor == 1.0:
-        return keypoints
+        return sequence
 
-    pose = keypoints[:99]
-    lh_flat = keypoints[99:162]
-    rh_flat = keypoints[162:225]
-
-    lh = reshape_hand(lh_flat)
-    rh = reshape_hand(rh_flat)
-
-    if np.all(lh == 0) and np.all(rh == 0):
-        return keypoints
-
+    augmented_sequence = []
     finger_groups = [
         range(1, 5), range(5, 9), range(9, 13), range(13, 17), range(17, 21),
     ]
 
-    for group in finger_groups:
-        if not np.all(lh == 0):
-            lh[list(group)] = scale_finger(lh[list(group)], scale_factor)
-        if not np.all(rh == 0):
-            rh[list(group)] = scale_finger(rh[list(group)], scale_factor)
+    for frame_keypoints in sequence:
+        pose = frame_keypoints[:99]
+        lh_flat = frame_keypoints[99:162]
+        rh_flat = frame_keypoints[162:225]
 
-    lh = clip_coords(lh)
-    rh = clip_coords(rh)
+        # Only augment if hands are present
+        if np.all(lh_flat == 0) and np.all(rh_flat == 0):
+            augmented_sequence.append(frame_keypoints)
+            continue
 
-    return np.concatenate([pose, flatten_hand(lh), flatten_hand(rh)])
+        lh = reshape_hand(lh_flat)
+        rh = reshape_hand(rh_flat)
+
+        for group in finger_groups:
+            if not np.all(lh == 0):
+                lh[list(group)] = scale_finger(lh[list(group)], scale_factor)
+            if not np.all(rh == 0):
+                rh[list(group)] = scale_finger(rh[list(group)], scale_factor)
+
+        lh = clip_coords(lh)
+        rh = clip_coords(rh)
+
+        new_keypoints = np.concatenate([pose, flatten_hand(lh), flatten_hand(rh)])
+        augmented_sequence.append(new_keypoints)
+
+    return np.array(augmented_sequence)
 
 
-# === MAIN PROCESSING LOOP ===
+def apply_jitter(sequence, strength):
+    """
+    Applies jitter (random noise) to the hand keypoints in a sequence.
+    'sequence' must be a numpy array of shape (SEQUENCE_LENGTH, 225)
+    """
+    if strength == 0.0:
+        return sequence
+
+    # Create noise with the same shape as the sequence
+    noise = np.random.normal(0.0, strength, sequence.shape)
+
+    # Zero out the noise for the pose keypoints (indices 0-98)
+    noise[:, :99] = 0.0
+
+    return sequence + noise
+
+
+# === MAIN PROCESSING LOOP (Refactored for Efficiency) ===
 def main():
     """
-    Processes each video multiple times with different scale factors to augment the dataset.
+    Processes each video ONCE, then applies all augmentations in memory
+    before saving each augmented sequence as a SINGLE .npy file.
     """
-    # Find all video files first
     video_paths_to_process = []
-    for dirpath, _, filenames in os.walk(VIDEO_ROOT):
-        for filename in filenames:
-            if filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-                video_paths_to_process.append(os.path.join(dirpath, filename))
+    video_root_path = Path(VIDEO_ROOT)
+    for ext in ['*.mp4', '*.avi', '*.mov', '*.mkv']:
+        video_paths_to_process.extend(video_root_path.rglob(ext))
 
     print(f"Found {len(video_paths_to_process)} videos to process.")
 
-    # Process each video found
     for video_path in video_paths_to_process:
-        class_name = os.path.basename(os.path.dirname(video_path))
-        video_name = Path(video_path).stem
+        class_name = video_path.parent.name
+        video_name = video_path.stem
+        print(f"\n🎥 Processing video: {video_path}")
 
-        print(f"\n🎥 Augmenting video: {video_path}")
+        # --- 1. Extract Keypoints (Read video ONLY ONCE) ---
+        cap = cv.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            print(f"    ⚠️ Error: Could not open video. Skipping.")
+            continue
 
-        # Loop through each scale factor to create a new variant
-        for scale_factor in SCALE_VALUES:
+        total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
+        original_keypoints_sequence = []
 
-            # --- 1. Define Paths for this variant ---
-            sequence_name = f"{video_name}_scale_{scale_factor:.1f}"
-            save_dir = os.path.join(SAVE_ROOT, class_name, sequence_name)
-            os.makedirs(save_dir, exist_ok=True)
+        if total_frames == 0:
+            print(f"    ⚠️ Error: Video has 0 frames. Skipping.")
+            cap.release()
+            continue
 
-            print(f"  → Generating variant with scale={scale_factor:.1f}")
+        # Get frame indices to sample
+        indices_to_process = np.linspace(0, total_frames - 1, SEQUENCE_LENGTH,
+                                         dtype=int) if total_frames > SEQUENCE_LENGTH else np.arange(total_frames)
 
-            # --- 2. Extract Frames ---
-            cap = cv.VideoCapture(video_path)
-            if not cap.isOpened():
-                print(f"    ⚠️ Error: Could not open video file. Skipping this variant.")
+        for frame_idx in indices_to_process:
+            cap.set(cv.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                original_keypoints_sequence.append(np.zeros(225))
                 continue
 
-            total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
-            sequence_keypoints = []
+            try:
+                image_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+                image_rgb.flags.writeable = False
+                results = holistic.process(image_rgb)
+                keypoints = extract_keypoints(results)
+                original_keypoints_sequence.append(keypoints)
+            except Exception as e:
+                print(f"    Error processing frame {frame_idx}: {e}")
+                original_keypoints_sequence.append(np.zeros(225))
 
-            indices_to_process = np.linspace(0, total_frames - 1, SEQUENCE_LENGTH,
-                                             dtype=int) if total_frames > SEQUENCE_LENGTH else range(total_frames)
+        cap.release()
 
-            for frame_idx in indices_to_process:
-                cap.set(cv.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-                if not ret:
-                    print(f"    ⚠️ Warning: Could not read frame {frame_idx}")
-                    continue
+        # --- 2. Pad Sequence (if video was shorter than SEQUENCE_LENGTH) ---
+        if not original_keypoints_sequence:
+            print(f"    ⚠️ Error: No keypoints extracted. Skipping.")
+            continue
 
-                try:
-                    image_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-                    image_rgb.flags.writeable = False
-                    results = holistic.process(image_rgb)
+        while len(original_keypoints_sequence) < SEQUENCE_LENGTH:
+            original_keypoints_sequence.append(original_keypoints_sequence[-1])  # Pad with last frame
 
-                    # Check if MediaPipe detected anything
-                    if not results.pose_landmarks and not results.left_hand_landmarks and not results.right_hand_landmarks:
-                        print(f"    ⚠️ Warning: No landmarks detected in frame {frame_idx}")
-                        # Use zeros as fallback
-                        keypoints = np.zeros(225)
-                    else:
-                        keypoints = extract_keypoints(results)
+        # Convert to a single numpy array
+        try:
+            base_sequence = np.array(original_keypoints_sequence)
+        except ValueError as e:
+            print(f"    ⚠️ Error: Mismatch in keypoint array shapes. Skipping. Details: {e}")
+            continue
 
-                    # Validate keypoints
-                    if len(keypoints) != 225:
-                        print(f"    ⚠️ Warning: Invalid keypoints length {len(keypoints)}, expected 225")
-                        keypoints = np.zeros(225)  # Use zeros as fallback
+        # --- 3. Apply Augmentations & Save (Smarter Storage) ---
+        save_dir = Path(SAVE_ROOT) / class_name
+        save_dir.mkdir(parents=True, exist_ok=True)
 
-                    # Scale the keypoints
-                    scaled_keypoints = scale_keypoints(keypoints, scale_factor)
-                    sequence_keypoints.append(scaled_keypoints)
+        # A. Apply SCALING augmentations
+        for scale_factor in SCALE_VALUES:
+            # Generate the new sequence
+            augmented_sequence = apply_scaling(base_sequence, scale_factor)
 
-                except Exception as e:
-                    print(f"    ⚠️ Error processing frame {frame_idx}: {e}")
-                    # Use zeros as fallback
-                    sequence_keypoints.append(np.zeros(225))
+            # Define the single .npy file path
+            sequence_name = f"{video_name}_scale_{scale_factor:.1f}.npy"
+            save_path = save_dir / sequence_name
 
-            cap.release()
+            # Save the ENTIRE sequence (20, 225) as one file
+            np.save(save_path, augmented_sequence)
 
-            # --- 3. Pad & Save ---
-            if len(sequence_keypoints) > 0:
-                while len(sequence_keypoints) < SEQUENCE_LENGTH:
-                    sequence_keypoints.append(sequence_keypoints[-1])
+        # B. Apply JITTER augmentations (based on the original 1.0 scale)
+        for strength in JITTER_STRENGTHS:
+            # We jitter the *original* (scale=1.0) sequence
+            augmented_sequence = apply_jitter(base_sequence, strength)
 
-                for i, keypoints in enumerate(sequence_keypoints):
-                    filename = f"frame_{i:05d}.npy"
-                    path = os.path.join(save_dir, filename)
-                    np.save(path, keypoints)
-                print(f"    ✅ Saved {len(sequence_keypoints)} frames to {save_dir}")
-            else:
-                print(f"    ⚠️ Warning: No keypoints extracted for this variant. Skipping.")
+            sequence_name = f"{video_name}_jitter_{strength:.3f}.npy"
+            save_path = save_dir / sequence_name
+            np.save(save_path, augmented_sequence)
 
-    print("\nAll videos have been augmented!")
+        print(f"    ✅ Saved {len(SCALE_VALUES) + len(JITTER_STRENGTHS)} augmentations for {video_name}")
+
+    print("\nAll videos have been processed and augmented!")
 
 
 if __name__ == "__main__":
