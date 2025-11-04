@@ -6,11 +6,10 @@ This project implements a real-time sign language recognition system using Media
 
 - `main.py` - Real-time inference application
 - `train_model.py` - Model training script
-- `preproccess.py` - Data collection script for creating training data
 - `my_functions.py` - Utility functions for keypoint extraction and image processing
 - `aaa.py` - Video augmentation script for creating scaled datasets
-- `bbb.py` - Visualization script for comparing different scales
 - `dataset/` - Training data directory with organized sequences
+- `llm_sentance_generator.py` - Generating meaningful sentences from predicted words
 
 ## Fixed Issues
 
@@ -43,13 +42,13 @@ pip install -r requirements.txt
 
 ## Usage
 
-### 1. Data Collection
+### 1. Data Augmentation
 To collect new training data:
 ```bash
-python preproccess.py
+python augmentation.py
 ```
-- Press spacebar to start recording each sequence
-- The script will record 20 frames for each sign
+- Prepare dataset with videos in corresponding class names
+- The script will augment the videos in different scale and you will get more data for training
 - Data is saved in the `dataset/` directory
 
 ### 2. Model Training
@@ -81,8 +80,8 @@ Each training sequence consists of:
 
 ## Model Architecture
 
-- Input: (20, 225) - 20 frames with 225 features each
-- LSTM layers: 64 → 128 → 64 units
+- Input: (30, 225) - 30 frames with 225 features each
+- LSTM layers: 64 → 192 → 128 → 128 units
 - Dense layers: 128 → 64 → num_classes
 - Output: Softmax probabilities for each sign class
 
@@ -120,9 +119,7 @@ Each training sequence consists of:
 
 - `main.py`: Main application for real-time inference
 - `train_model.py`: Training script with improved architecture and validation
-- `preproccess.py`: Data collection script for creating training sequences
+- `augmentation.py`: Preprocessing and augmenting data
 - `my_functions.py`: Core utility functions for keypoint extraction
-- `aaa.py`: Video augmentation for creating scaled training data
-- `bbb.py`: Visualization tool for comparing different data scales
 - `requirements.txt`: Python package dependencies
 - `README.md`: This documentation file
