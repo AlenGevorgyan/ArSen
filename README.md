@@ -34,7 +34,7 @@ This project enables real-time recognition of sign language gestures through a w
 ```
 Arsen_AI/
 ├── main.py                      # Real-time inference application
-├── train_model.py              # Model training script
+├── train_model.py              # Model training script (Python or Colab)
 ├── visualize.py                # Training metrics and data visualization
 ├── my_functions.py             # Keypoint extraction utilities
 ├── augmentation.py             # Video augmentation pipeline
@@ -72,6 +72,8 @@ pip install -r requirements.txt
 
 ### Basic Usage
 
+**Local Environment:**
+
 1. **Train the model**:
 ```bash
 python train_model.py --data_dir dataset --epochs 100
@@ -86,6 +88,14 @@ python main.py
 ```bash
 python visualize.py
 ```
+
+**Google Colab:**
+
+1. Open a new Colab notebook
+2. Enable GPU: Runtime → Change runtime type → GPU
+3. Follow the Colab training steps in the "Model Training" section below
+4. Download the trained model files
+5. Use them locally with `main.py` for inference
 
 ## 📊 System Architecture
 
@@ -175,6 +185,8 @@ python augmentation.py
 
 ### 2. Model Training
 
+#### Local Training
+
 **Basic Training**:
 ```bash
 python train_model.py --data_dir dataset --epochs 100
@@ -193,20 +205,93 @@ python train_model.py \
     --lr 0.0005
 ```
 
+#### Google Colab Training
+
+**Step 1: Setup Colab Environment**
+```python
+# Install dependencies
+!pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+!pip install mediapipe opencv-python numpy scikit-learn tqdm matplotlib seaborn
+```
+
+**Step 2: Mount Google Drive (if dataset is in Drive)**
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+**Step 3: Upload Dataset**
+```python
+# Option A: Upload zip file
+from google.colab import files
+import zipfile
+import os
+
+uploaded = files.upload()
+for fn in uploaded.keys():
+    if fn.endswith('.zip'):
+        with zipfile.ZipFile(fn, 'r') as zip_ref:
+            zip_ref.extractall('/content/')
+        os.remove(fn)
+
+# Option B: Use from Drive
+# DATASET_PATH = "/content/drive/MyDrive/Arsen_AI/dataset_processed"
+```
+
+**Step 4: Upload Training Script**
+```python
+# Upload train_model.py or copy from Drive
+from google.colab import files
+uploaded = files.upload()  # Select train_model.py
+
+# Or copy from Drive:
+# !cp /content/drive/MyDrive/Arsen_AI/train_model.py /content/
+```
+
+**Step 5: Configure and Train**
+```python
+import sys
+sys.path.append('/content')
+
+from train_model import main
+
+# Configure training parameters
+class Config:
+    def __init__(self):
+        self.data_dir = "/content/dataset_processed"  # Adjust to your path
+        self.seq_len = 20
+        self.epochs = 150
+        self.batch_size = 64  # Bigger batch size for GPU
+        self.lr = 1e-3
+        self.hidden_size = 128
+        self.num_layers = 2
+        self.dropout = 0.4
+
+args = Config()
+main(args)
+```
+
+**Step 6: Download Results**
+```python
+from google.colab import files
+
+files.download('best_model.pth')
+files.download('class_mapping.npy')
+```
+
 **Training Arguments**:
-- `--data_dir`: Dataset directory path (default: `dataset`)
-- `--seq_len`: Sequence length in frames (default: 20)
-- `--epochs`: Number of training epochs (default: 100)
-- `--batch_size`: Batch size (default: 32)
-- `--hidden_size`: GRU hidden size (default: 128)
-- `--num_layers`: Number of GRU layers (default: 2)
-- `--dropout`: Dropout rate (default: 0.3)
-- `--lr`: Learning rate (default: 0.001)
+- `data_dir`: Dataset directory path (default: `dataset` or `/content/dataset_processed` for Colab)
+- `seq_len`: Sequence length in frames (default: 20)
+- `epochs`: Number of training epochs (default: 100)
+- `batch_size`: Batch size (default: 32, use 64+ for Colab GPU)
+- `hidden_size`: GRU hidden size (default: 128)
+- `num_layers`: Number of GRU layers (default: 2)
+- `dropout`: Dropout rate (default: 0.4)
+- `lr`: Learning rate (default: 0.001)
 
 **Output**:
 - `best_model.pth`: Best model based on validation loss
 - `class_mapping.npy`: Class name to index mapping
-- `training_history.json`: Training metrics for visualization
 
 ### 3. Real-time Inference
 
@@ -374,6 +459,27 @@ The model can be exported for deployment:
 - Ensure Ollama server is running: `ollama serve`
 - Check model is available: `ollama list`
 - System will fall back to simple concatenation if unavailable
+
+### Colab-Specific Issues
+
+**"No module named 'train_model'"**
+- Solution: Make sure `train_model.py` is uploaded to `/content/` directory
+- Or add the path: `sys.path.append('/content')`
+
+**"Dataset not found"**
+- Check the path in Config class matches your actual dataset location
+- Use absolute paths like `/content/dataset_processed` or `/content/drive/MyDrive/...`
+- Verify dataset is uploaded/extracted correctly
+
+**"CUDA out of memory"**
+- Reduce `batch_size` (try 32 or 16)
+- Reduce `hidden_size` or `num_layers`
+- Use mixed precision training (future enhancement)
+
+**"Session timeout"**
+- Colab sessions timeout after ~12 hours
+- Save checkpoints frequently
+- Copy important files to Google Drive regularly
 
 ## 📚 Dependencies
 
