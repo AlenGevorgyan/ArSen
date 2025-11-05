@@ -6,9 +6,6 @@ dataset/
 dataset_processed/
 videos/
 
-# Ignore model weights
-api.py
-
 # Ignore generated mapping/scaler files
 class_mapping.npy
 feature_scaler.pkl
