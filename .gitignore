@@ -4,10 +4,12 @@
 # Ignore raw and processed datasets
 dataset/
 dataset_processed/
+videos/
 
 # Ignore model weights
 best_model.pth
 my_model.pth
+api.py
 
 # Ignore generated mapping/scaler files
 class_mapping.npy
