@@ -236,4 +236,4 @@ async def predict_video(file: UploadFile = File(...)):
 if __name__ == "__main__":
     # This makes the script runnable with: python api.py
     # It will run on http://127.0.0.1:8000
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
